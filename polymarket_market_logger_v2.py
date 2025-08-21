@@ -254,22 +254,34 @@ class MarketSubscriber:
 
 
 def main():
+    parser = argparse.ArgumentParser(description="Polymarket market-channel logger (V3 MAX COMPRESSION).")
+    parser.add_argument("--asset", required=False,
+                        default="99893023379138991987588721165418832163151219014135327227724239090994347225334",
+                        help="asset_id to subscribe to")
+    parser.add_argument("--out", required=True, help="output file path")
+    parser.add_argument("--verbose", action="store_true", help="enable stderr logging")
+    parser.add_argument("--raw", action="store_true",
+                        help="store raw JSON (no compression); implies --jsonl")
+    parser.add_argument("--jsonl", action="store_true",
+                        help="store JSONL wrapper records instead of bare base64 lines")
+    args = parser.parse_args()
 
-    asset = '60877716797186734067501445298560391388366404930163071113536019971288497460774'
-    out = r'C:\Users\hsee\OneDrive - LMR Partners\Documents\compression\v2\updates_12am.json'
-    verbose = True
-
-    if FrameCompressorV3 is None:
-        print("ERROR: decoder.FrameCompressorV3  not available. "
-                "Ensure decoder.py is in the same directory.", file=sys.stderr)
-    comp = FrameCompressorV3(asset_id=asset)
-    compression_fn = comp.compress
-    compact_records = True
+    if args.raw:
+        compression_fn = None
+        compact_records = False
+    else:
+        if FrameCompressorV3 is None:
+            print("ERROR: decoder.FrameCompressorV3 not available. Ensure decoder.py is in the same directory.",
+                  file=sys.stderr)
+            sys.exit(2)
+        comp = FrameCompressorV3(asset_id=args.asset)
+        compression_fn = comp.compress  # returns str or [str, ...]
+        compact_records = not args.jsonl
 
     sub = MarketSubscriber(
-        asset_id=asset,
-        out_path=out,
-        verbose=verbose,
+        asset_id=args.asset,
+        out_path=args.out,
+        verbose=args.verbose,
         compression_fn=compression_fn,
         compact_records=compact_records,
     )
