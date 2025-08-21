@@ -1,0 +1,509 @@
+<h1 id="polymarket-market-channel-v3-max-compression-codec-and-decoder-">Polymarket Market Channel — <strong>V3 Max‑Compression Codec and Decoder</strong></h1>
+<p><strong>Component names:</strong></p>
+<ul>
+<li>Logger: <code>polymarket_market_logger.py</code></li>
+<li>Codec/Decoder: <code>decoder.py</code> (contains <code>FrameCompressorV3</code> and reinflation tooling)</li>
+</ul>
+<hr>
+<h2 id="0-executive-summary">0) Executive summary</h2>
+<p>This is a <strong>stateful, line‑oriented, binary codec</strong> designed to make Polymarket market‑channel websocket dumps <strong>as small as possible</strong> while preserving the information you care about. It replaces verbose JSON per frame with:</p>
+<ul>
+<li>A <strong>single session header</strong> (first line) that carries the <code>asset_id</code> and a base timestamp.</li>
+<li>One <strong>raw‑DEFLATE</strong> (no zlib header/trailer) <strong>binary record per frame</strong>, base64‑URL encoded per line.</li>
+</ul>
+<h3 id="techniques-used-size-wins-">Techniques used (size wins)</h3>
+<ol>
+<li><strong>Key elimination</strong>: permanently drop <code>market</code> and <code>hash</code> fields.</li>
+<li><strong>Single‑asset session header</strong>: store <code>asset_id</code> once, then omit it from all events.</li>
+<li><strong>Timestamp delta encoding</strong>: each event stores a small <strong>varint delta</strong> vs. the previous timestamp.</li>
+<li><strong>String dictionary pooling</strong> (session‑wide): first occurrence stored once; later repeats become tiny <strong>varint references</strong>. Works great for repeated <strong>prices</strong>, <strong>sizes</strong>, and common string values.</li>
+<li><strong>Positional binary representation</strong>: no JSON keys inside frames; compact, bit‑level type tags.</li>
+<li><strong>Raw DEFLATE</strong> + <strong>base64‑URL</strong> per line: removes zlib’s 2‑byte header and 4‑byte checksum per message compared to <code>zlib</code> streams.</li>
+</ol>
+<p>The decoder restores the original event <strong>shape</strong> (arrays of events per frame), <strong>reinserts <code>asset_id</code></strong> from the header, and still <strong>omits</strong> <code>market</code>/<code>hash</code> by design.</p>
+<hr>
+<h2 id="1-assumptions-constraints-and-guarantees">1) Assumptions, constraints, and guarantees</h2>
+<p><strong>Assumptions</strong></p>
+<ul>
+<li>You log <strong>one asset per process</strong> (single‑asset mode). The <code>asset_id</code> is written once in the header.</li>
+<li><p>Market channel frames are either:</p>
+<ul>
+<li>a <strong>JSON array of one or more events</strong> (typical), or</li>
+<li>a <strong>single JSON object</strong>, or</li>
+<li>a <strong>raw text</strong> string like <code>&quot;PONG&quot;</code>.</li>
+</ul>
+</li>
+</ul>
+<p><strong>Constraints</strong></p>
+<ul>
+<li><strong>Header required</strong>: decoding requires reading from a file position <strong>at or after</strong> a header line for that session. If you split logs, include the header.</li>
+<li><strong>Timestamp presence</strong>: events are expected to include <code>&quot;timestamp&quot;</code> as a string of milliseconds. If missing or non‑numeric, that event’s timestamp is encoded as <strong>absolute 0</strong> (rare in practice).</li>
+<li><strong>Dropped fields</strong>: <code>market</code> and <code>hash</code> are intentionally discarded; they will not appear on decode.</li>
+<li><strong>File format</strong>: <strong>one base64 token per line</strong>. Each line is a binary record (<code>Header</code>, <code>Frame</code>, or <code>Raw</code>) encoded as raw‑DEFLATE then base64‑URL.</li>
+</ul>
+<p><strong>Compatibility &amp; tolerance</strong></p>
+<ul>
+<li>Decoder also <strong>accepts older/mixed files</strong>: JSONL wrappers (<code>{&quot;m&quot;:...}</code>, <code>{&quot;c&quot;:&quot;...&quot;}</code>), escaped JSON lines, and previous zlib+base64 JSON arrays. It normalizes them to the same output shape and drops <code>market</code>/<code>hash</code>.</li>
+</ul>
+<p><strong>Data integrity &amp; reversibility</strong></p>
+<ul>
+<li>All retained fields round‑trip byte‑exact as strings (e.g., <code>&quot;0.06&quot;</code>, <code>&quot;28.82&quot;</code>).</li>
+<li>Event arrays per frame are preserved; <strong>order is maintained</strong>.</li>
+</ul>
+<hr>
+<h2 id="2-high-level-format-wire-spec-">2) High‑level format (wire spec)</h2>
+<p>Each output line is base64‑URL text of a <strong>raw DEFLATE</strong> payload:</p>
+<pre><code><span class="hljs-tag">&lt;<span class="hljs-name">base64url_of_raw_deflate(record_bytes)</span>&gt;</span>\n
+</code></pre><p>There are three record kinds (first byte):</p>
+<table>
+<thead>
+<tr>
+<th style="text-align:right">Kind</th>
+<th style="text-align:center">Byte</th>
+<th>Meaning</th>
+</tr>
+</thead>
+<tbody>
+<tr>
+<td style="text-align:right">H</td>
+<td style="text-align:center">0x48</td>
+<td><strong>Header</strong> (version, flags, base_ts, asset)</td>
+</tr>
+<tr>
+<td style="text-align:right">F</td>
+<td style="text-align:center">0x46</td>
+<td><strong>Frame</strong> (array of events)</td>
+</tr>
+<tr>
+<td style="text-align:right">X</td>
+<td style="text-align:center">0x58</td>
+<td><strong>Raw</strong> (non‑JSON text, e.g., &quot;PONG&quot;)</td>
+</tr>
+</tbody>
+</table>
+<h3 id="2-1-header-h-">2.1 Header (<code>H</code>)</h3>
+<pre><code>'H' | <span class="hljs-type">uvarint</span>(version=<span class="hljs-number">3</span>) | <span class="hljs-type">uvarint</span>(flags) | <span class="hljs-type">uvarint</span>(base_ts) | <span class="hljs-type">uvarint</span>(asset_count=<span class="hljs-number">1</span>)
+     | <span class="hljs-type">uvarint</span>(len(asset_id)) | <span class="hljs-type">bytes</span>(asset_id)
+</code></pre><ul>
+<li><strong>flags bit 0</strong> = single‑asset mode (always set).</li>
+<li><strong>base_ts</strong> = first numeric <code>&quot;timestamp&quot;</code> seen (or <code>0</code> if none seen before header).</li>
+<li><strong>String pool is </strong>reset<strong> when a header is read/written.</strong></li>
+</ul>
+<h3 id="2-2-frame-f-">2.2 Frame (<code>F</code>)</h3>
+<pre><code>'F' | <span class="hljs-type">uvarint</span>(event_count) | <span class="hljs-type">event</span> * event_count
+</code></pre><p><strong>Event</strong> (repeated):</p>
+<pre><code>type_byte | <span class="hljs-type">uvarint</span>(ts_value) | <span class="hljs-type">payload</span>...
+</code></pre><p><code>type_byte</code> layout:</p>
+<ul>
+<li><p><strong>bits 0..2</strong>: event type code</p>
+<ul>
+<li>0 = <code>book</code></li>
+<li>1 = <code>price_change</code></li>
+<li>2 = <code>tick_size_change</code></li>
+<li>3 = <code>last_trade_price</code></li>
+</ul>
+</li>
+<li><strong>bit 5</strong>: timestamp mode (0 = delta vs previous event ts, 1 = absolute)</li>
+<li><strong>bit 3</strong>: optional field presence (currently used by <code>last_trade_price.fee_rate_bps</code>)</li>
+</ul>
+<p><strong>Timestamp encoding</strong></p>
+<ul>
+<li>If <code>ts_abs=0</code>, stored <code>ts_value = ts_current - ts_previous</code> (≥ 0).</li>
+<li>If <code>ts_abs=1</code>, stored <code>ts_value = ts_current</code> (absolute).</li>
+<li>Decoder maintains <code>prev_ts</code> and reconstructs <code>ts_current</code>.</li>
+</ul>
+<p><strong>Payloads</strong></p>
+<ul>
+<li><p><strong>book (0)</strong></p>
+<pre><code>uvarint(n_bids) | (<span class="hljs-built_in">str</span> price, <span class="hljs-built_in">str</span> <span class="hljs-built_in">size</span>) * n_bids
+uvarint(n_asks) | (<span class="hljs-built_in">str</span> price, <span class="hljs-built_in">str</span> <span class="hljs-built_in">size</span>) * n_asks
+</code></pre><p><em>Strings</em> use the <strong>string pool</strong> (see §3). <code>bids/asks</code> accept <code>buys/sells</code> synonyms.</p>
+</li>
+<li><p><strong>price_change (1)</strong></p>
+<pre><code>uvarint(n_changes) | (<span class="hljs-built_in">byte</span> side, <span class="hljs-built_in">str</span> price, <span class="hljs-built_in">str</span> <span class="hljs-built_in">size</span>) * n_changes
+</code></pre><p><code>side</code> = 0 for BUY, 1 for SELL.</p>
+</li>
+<li><p><strong>tick_size_change (2)</strong></p>
+<pre><code><span class="hljs-keyword">str</span> old_tick_size | <span class="hljs-keyword">str</span> new_tick_size
+</code></pre></li>
+<li><p><strong>last_trade_price (3)</strong></p>
+<pre><code><span class="hljs-built_in">str</span> price | <span class="hljs-built_in">str</span> <span class="hljs-built_in">size</span> | <span class="hljs-built_in">byte</span> side | [<span class="hljs-built_in">str</span> fee_rate_bps <span class="hljs-keyword">if</span> (type_byte bit <span class="hljs-number">3</span> <span class="hljs-built_in">set</span>)]
+</code></pre><p><code>side</code> = 0 for BUY, 1 for SELL.</p>
+</li>
+</ul>
+<h3 id="2-3-raw-x-">2.3 Raw (<code>X</code>)</h3>
+<pre><code><span class="hljs-string">'X'</span> | <span class="hljs-built_in">str</span> <span class="hljs-built_in">text</span>
+</code></pre><p>Used for unparsed text frames (e.g., <code>&quot;PONG&quot;</code>). The text is encoded through the <strong>string pool</strong>.</p>
+<hr>
+<h2 id="3-string-pool-dictionary-pooling-">3) String pool (dictionary pooling)</h2>
+<p>A <strong>session‑wide dictionary</strong> converts repeated strings to tiny IDs. This saves heavily on repeated <strong>prices</strong> (<code>&quot;0.01&quot;</code>, <code>&quot;0.05&quot;</code>, …) and <strong>sizes</strong>.</p>
+<p><strong>Encoding rule (per string):</strong></p>
+<ul>
+<li><p>If the string has been seen in this session:</p>
+<pre><code>uvarint( (<span class="hljs-name">id</span> &lt;&lt; <span class="hljs-number">1</span>) | <span class="hljs-number">0</span> )      # reference
+</code></pre></li>
+<li><p>If new literal:</p>
+<pre><code>uvarint( (<span class="hljs-name">len</span>(<span class="hljs-name">bytes</span>) &lt;&lt; <span class="hljs-number">1</span>) | 1 ) | bytes(<span class="hljs-name">utf8</span>)   # literal<span class="hljs-comment">; then string is added to pool</span>
+</code></pre></li>
+</ul>
+<p><strong>Decoding rule:</strong>
+Read <code>v = uvarint()</code>.
+If <code>(v &amp; 1) == 0</code>: it’s a <strong>reference</strong>. ID = <code>v &gt;&gt; 1</code> → fetch from pool.
+Else: it’s a <strong>literal</strong>; length = <code>v &gt;&gt; 1</code>; read that many bytes, add to pool, return the string.</p>
+<p><strong>Pool lifecycle:</strong> reset at <strong>header</strong>. (A future optimization is periodic header re‑emission to keep ID widths very small when vocabularies drift.)</p>
+<hr>
+<h2 id="4-varints-unsigned-leb128-">4) Varints (unsigned LEB128)</h2>
+<p>All integers (“<code>uvarint</code>” above) use standard <strong>unsigned LEB128</strong>: 7 bits per byte with MSB as continuation.</p>
+<ul>
+<li>Small values (e.g., timestamp deltas of a few milliseconds) often fit in <strong>one byte</strong>.</li>
+<li>Typical price/size references also fit in <strong>one byte</strong> for small IDs.</li>
+</ul>
+<hr>
+<h2 id="5-compression-effects-why-this-is-small-">5) Compression effects (why this is small)</h2>
+<ol>
+<li><strong>No repeating <code>asset_id</code></strong>: previously ~77 bytes per event; now <strong>0</strong> after header.</li>
+<li><strong>No JSON keys</strong> per field: binary positional format replaces <code>&quot;event_type&quot;:&quot;...&quot;</code>, <code>&quot;bids&quot;</code>, <code>&quot;asks&quot;</code>, <code>&quot;price&quot;</code>, <code>&quot;size&quot;</code>, etc.</li>
+<li><strong>Delta timestamps</strong>: <code>&quot;1755744525187&quot;</code> (13 ASCII chars) becomes a varint of the small <strong>delta</strong> (often 1–3 bytes).</li>
+<li><strong>String pooling</strong>: common decimals turn into tiny IDs on subsequent occurrences (1–2 bytes).</li>
+<li><strong>Dropped fields</strong>: <code>market</code>, <code>hash</code> <strong>never</strong> stored.</li>
+<li><strong>Raw DEFLATE</strong>: removes zlib header/footer (~6 bytes) per line.</li>
+<li><strong>Base64 overhead</strong> is ~33%; despite that, net size shrinks significantly because binary is far smaller than text JSON.</li>
+</ol>
+<hr>
+<h2 id="6-module-api-walkthrough">6) Module &amp; API walkthrough</h2>
+<h3 id="6-1-logger-polymarket_market_logger-py-">6.1 Logger (<code>polymarket_market_logger.py</code>)</h3>
+<h4 id="-durablejsonlwriter-"><code>DurableJsonlWriter</code></h4>
+<ul>
+<li><code>write_line(str)</code>: writes raw token + newline, fsyncs.</li>
+<li><code>write_json(obj)</code>: JSON‑minified + newline, fsyncs.</li>
+<li>Ensures durability on crash/power loss.</li>
+</ul>
+<h4 id="-marketsubscriber-"><code>MarketSubscriber</code></h4>
+<ul>
+<li>Manages the websocket lifecycle (<code>websocket-client</code>).</li>
+<li>Subscribes to <code>type=&quot;market&quot;</code> for the given <code>asset_id</code>.</li>
+<li><p><strong>on_message</strong>:</p>
+<ul>
+<li>Calls the <code>compression_fn</code> if provided.</li>
+<li>Accepts return of <strong>string</strong> (one line) <strong>or list of strings</strong> (header + frame).</li>
+<li>Writes compact lines (<code>write_line</code>) by default; or JSONL wrappers if <code>--jsonl</code>.</li>
+</ul>
+</li>
+</ul>
+<p><strong>CLI</strong></p>
+<pre><code class="lang-bash"><span class="hljs-keyword">python</span> polymarket_market_logger.<span class="hljs-keyword">py</span> --asset <span class="hljs-symbol">&lt;ASSET_ID&gt;</span> --out updates.v3
+# Debug variant<span class="hljs-variable">s:</span>
+<span class="hljs-keyword">python</span> polymarket_market_logger.<span class="hljs-keyword">py</span> --jsonl ...
+<span class="hljs-keyword">python</span> polymarket_market_logger.<span class="hljs-keyword">py</span> --raw --jsonl ...
+</code></pre>
+<h3 id="6-2-codec-decoder-decoder-py-">6.2 Codec/Decoder (<code>decoder.py</code>)</h3>
+<h4 id="-framecompressorv3-"><code>FrameCompressorV3</code></h4>
+<ul>
+<li><p><strong>Stateful</strong> per process:</p>
+<ul>
+<li><code>_StringPool pool</code></li>
+<li><code>base_ts</code>, <code>prev_ts</code></li>
+<li><code>wrote_header</code></li>
+</ul>
+</li>
+<li><p><strong>compress(raw_frame_str)</strong>:</p>
+<ol>
+<li>Parse JSON. If not JSON → emit <code>X</code> (raw) record; first call emits <code>H</code> header first.</li>
+<li>If JSON <strong>list</strong>: treat as array of events. If <strong>dict</strong>: wrap as single event.</li>
+<li>Extract first numeric timestamp to set <code>base_ts</code> (header).</li>
+<li>Drop <code>market</code> / <code>hash</code> in each event.</li>
+<li><p>Emit <code>F</code> record with:</p>
+<ul>
+<li>event_count</li>
+<li><p>for each event:</p>
+<ul>
+<li><code>type_byte</code> with event type, ts mode, optional bit</li>
+<li><code>uvarint(ts_delta or ts_abs)</code></li>
+<li>payload (prices/sizes via string pool)</li>
+</ul>
+</li>
+</ul>
+</li>
+<li><p>Return:</p>
+<ul>
+<li><code>[header_line, frame_line]</code> for the first time a header is needed,</li>
+<li>or just <code>frame_line</code> on subsequent calls.</li>
+</ul>
+</li>
+</ol>
+</li>
+</ul>
+<p><strong>Private helpers</strong>:</p>
+<ul>
+<li><code>_ensure_header(first_ts)</code>: builds and returns a base64 <code>H</code> if not written yet.</li>
+<li><code>_encode_frame_events(events)</code> → base64 <code>F</code>.</li>
+<li><code>_encode_event(ev, out)</code>, <code>_encode_book</code>, <code>_encode_price_change</code>, <code>_encode_tick_size_change</code>, <code>_encode_last_trade_price</code>.</li>
+<li><code>_encode_levels(levels, out)</code> handles bids/asks arrays.</li>
+</ul>
+<h4 id="decoder-stateful-v3-">Decoder (stateful V3)</h4>
+<ul>
+<li><p><code>_V3State</code>: pool, <code>base_ts</code>, <code>prev_ts</code>, <code>asset_ids</code>, <code>flags</code>, <code>have_header</code>.</p>
+</li>
+<li><p><code>_try_decode_v3_line(token, st)</code>:</p>
+<ul>
+<li>Inflates raw‑DEFLATE + base64 line.</li>
+<li>Switch on first byte (<code>H</code>, <code>F</code>, <code>X</code>).</li>
+<li><code>H</code>: update state; <strong>no output</strong>.</li>
+<li><code>F</code>: decode all events → <strong>emit one JSON array string</strong>.</li>
+<li><code>X</code>: decode raw text → <strong>emit JSON string</strong> (e.g., <code>&quot;PONG&quot;</code>).</li>
+<li>Return <code>None</code> if the token wasn’t V3.</li>
+</ul>
+</li>
+<li><p><code>_decode_header</code>, <code>_decode_frame</code>, <code>_decode_event</code> mirror the encoder; <code>_dec_levels</code> decodes <code>[price,size]</code> arrays; <code>_decode_raw</code> reproduces <code>&quot;PONG&quot;</code>.</p>
+</li>
+</ul>
+<h4 id="tolerant-reinflater">Tolerant reinflater</h4>
+<ul>
+<li><p><code>reinflate_file(input_path, output_path, ndjson=True)</code>:</p>
+<ul>
+<li><p>Streams the input; for each line:</p>
+<ol>
+<li>Try <strong>V3</strong> path first.</li>
+<li>Try legacy zlib+base64 JSON arrays.</li>
+<li>Try reading direct JSON or JSON string containing JSON.</li>
+<li>Else, output as a JSON string.</li>
+</ol>
+</li>
+<li>Drops <code>market</code>/<code>hash</code> in legacy JSON paths.</li>
+<li>Writes <strong>NDJSON</strong> (default) or a single JSON array (<code>--array</code>).</li>
+</ul>
+</li>
+</ul>
+<p><strong>CLI</strong></p>
+<pre><code class="lang-bash">python decoder<span class="hljs-selector-class">.py</span> --<span class="hljs-keyword">in</span> updates<span class="hljs-selector-class">.v3</span> --out updates<span class="hljs-selector-class">.ndjson</span>
+python decoder<span class="hljs-selector-class">.py</span> --<span class="hljs-keyword">in</span> updates<span class="hljs-selector-class">.v3</span> --out updates<span class="hljs-selector-class">.json</span> --array
+</code></pre>
+<hr>
+<h2 id="7-end-to-end-flow-compress-decode-">7) End‑to‑end flow (compress &amp; decode)</h2>
+<h3 id="7-1-compressor-flow-per-frame-">7.1 Compressor flow (per frame)</h3>
+<pre><code class="lang-mermaid">flowchart TD
+A[WS frame string]<span class="hljs-function"> --&gt;</span> B{JSON parse ok?}
+B -- <span class="hljs-literal">no</span><span class="hljs-function"> --&gt;</span> C[Ensure Header(base_ts=<span class="hljs-number">0</span>)]<span class="hljs-function"> --&gt;</span> D[Record X&lt;br/&gt;pool.encode(raw)]<span class="hljs-function"> --&gt;</span> E[raw-DEFLATE + b64]<span class="hljs-function"> --&gt;</span> F[write line]
+B -- <span class="hljs-literal">yes</span><span class="hljs-function"> --&gt;</span> G{Top-level list?}
+G -- <span class="hljs-literal">yes</span><span class="hljs-function"> --&gt;</span> H[events = list]
+G -- <span class="hljs-literal">no</span><span class="hljs-function"> --&gt;</span> I[events = [dict]]
+H<span class="hljs-function"> --&gt;</span> J[Find first numeric ts <span class="hljs-keyword">or</span> None]
+I<span class="hljs-function"> --&gt;</span> J
+J<span class="hljs-function"> --&gt;</span> K[Ensure Header(first_ts)]
+K<span class="hljs-function"> --&gt;</span> L[Drop market/hash <span class="hljs-keyword">in</span> events]
+L<span class="hljs-function"> --&gt;</span> M[Build <span class="hljs-string">'F'</span>: count + each event]
+M<span class="hljs-function"> --&gt;</span> N[For each event:&lt;br/&gt;type_byte + uvarint(ts) + payload]
+N<span class="hljs-function"> --&gt;</span> O[raw-DEFLATE + b64]
+O<span class="hljs-function"> --&gt;</span> P[write <span class="hljs-number">1</span> <span class="hljs-keyword">or</span> <span class="hljs-number">2</span> lines&lt;br/&gt;(H once, <span class="hljs-keyword">then</span> F)]
+</code></pre>
+<h3 id="7-2-decoder-flow-per-line-">7.2 Decoder flow (per line)</h3>
+<pre><code class="lang-mermaid">flowchart TD
+A[<span class="hljs-function"><span class="hljs-title">read</span> line] --&gt;</span> B{Try V3: inflate}
+B -- <span class="hljs-function"><span class="hljs-title">no</span> --&gt;</span> C{Legacy zlib+base64?}
+C -- <span class="hljs-function"><span class="hljs-title">yes</span> --&gt;</span> D[JSON <span class="hljs-function"><span class="hljs-title">decode</span> + drop market/hash] --&gt;</span> O[emit JSON value]
+C -- <span class="hljs-function"><span class="hljs-title">no</span> --&gt;</span> E{Direct JSON?}
+E -- <span class="hljs-function"><span class="hljs-title">yes</span> --&gt;</span> F[JSON <span class="hljs-function"><span class="hljs-title">decode</span> + drop market/hash] --&gt;</span> O
+E -- <span class="hljs-function"><span class="hljs-title">no</span> --&gt;</span> G{JSON string containing JSON?}
+G -- <span class="hljs-function"><span class="hljs-title">yes</span> --&gt;</span> H[U<span class="hljs-function"><span class="hljs-title">nescape</span> &amp; decode + drop] --&gt;</span> O
+G -- <span class="hljs-function"><span class="hljs-title">no</span> --&gt;</span> I[<span class="hljs-function"><span class="hljs-title">emit</span> <span class="hljs-keyword">as</span> JSON string] --&gt;</span> O
+
+B -- <span class="hljs-function"><span class="hljs-title">yes</span> --&gt;</span> J{Record kind}
+J -- H --&gt; K[D<span class="hljs-function"><span class="hljs-title">ecode</span> header&lt;br/&gt;reset pool, base_ts] --&gt;</span> A
+J -- F --&gt; L[D<span class="hljs-function"><span class="hljs-title">ecode</span> all events&lt;br/&gt;rebuild timestamps, asset_id] --&gt;</span> M[emit JSON array]
+J -- X --&gt; N[D<span class="hljs-function"><span class="hljs-title">ecode</span> string via pool] --&gt;</span> P[emit JSON string]
+</code></pre>
+<hr>
+<h2 id="8-section-by-section-deep-dive">8) Section‑by‑section deep dive</h2>
+<h3 id="8-1-timestamp-delta-encoding">8.1 Timestamp delta encoding</h3>
+<ul>
+<li>On the <strong>first event</strong>, <code>prev_ts = base_ts</code> from the header; encoder writes <strong>delta 0</strong> (1 varint byte).</li>
+<li>On <strong>monotonic</strong> sequences, most deltas are small (e.g., 0–50 ms), so <strong>1–2 bytes</strong> each.</li>
+<li>For <strong>out‑of‑order</strong> or <strong>missing</strong> timestamps, encoder switches to <strong>absolute</strong>: set type_byte bit 5 and store the full timestamp as a varint (still often shorter than 13 ASCII digits).</li>
+<li><p>Decoder reconstructs <code>ts</code> as:</p>
+<ul>
+<li><code>ts = prev_ts + delta</code> if not absolute,</li>
+<li><code>ts = absolute_value</code> otherwise.</li>
+</ul>
+</li>
+<li>Final JSON has <code>&quot;timestamp&quot;</code> as a <strong>string</strong>, matching source JSON semantics.</li>
+</ul>
+<h3 id="8-2-string-dictionary-pooling">8.2 String dictionary pooling</h3>
+<ul>
+<li>Works across the entire session (until next header resets it).</li>
+<li>First occurrence of a string uses a literal <strong>length + bytes</strong>; subsequent occurrences are <strong>references</strong> with tiny IDs.</li>
+<li>For order‑book heavy traffic, <code>&quot;0.01&quot;</code>, <code>&quot;0.05&quot;</code>, <code>&quot;1000&quot;</code>, <code>&quot;5000&quot;</code>, etc., become <strong>1‑byte refs</strong> after first use.</li>
+</ul>
+<h3 id="8-3-binary-event-bodies">8.3 Binary event bodies</h3>
+<ul>
+<li><strong>book</strong>: two lists of <code>(price,size)</code> pairs → both strings go through the pool.</li>
+<li><strong>price_change</strong>: <code>side</code> gets its <strong>own 1 byte</strong> (0/1).</li>
+<li><strong>tick_size_change</strong>: two pooled strings.</li>
+<li><strong>last_trade_price</strong>: optional <code>fee_rate_bps</code> is guarded by <strong>type_byte bit 3</strong>.</li>
+</ul>
+<h3 id="8-4-raw-vs-zlib-vs-raw-deflate">8.4 Raw vs. zlib vs. raw DEFLATE</h3>
+<ul>
+<li>Raw DEFLATE removes ~6 bytes per line (zlib header+adler32), which matters a lot for <strong>many tiny lines</strong>.</li>
+<li>Safety: treat the data as untrusted; decoder already defends by streaming line‑by‑line and not expanding beyond memory limits. (If you ingest unknown files, consider size/line limits.)</li>
+</ul>
+<h3 id="8-5-file-i-o-durability">8.5 File I/O &amp; durability</h3>
+<ul>
+<li><code>DurableJsonlWriter</code> uses <strong>line buffering</strong>, flush, and <strong>fsync per line</strong> so no frame is lost on crash.</li>
+<li>If you want <strong>even smaller</strong> logs and can trade durability, batching fsync (e.g., every N lines) cuts syscalls.</li>
+</ul>
+<hr>
+<h2 id="9-error-handling-resilience">9) Error handling &amp; resilience</h2>
+<ul>
+<li><strong>Compression failure</strong>: logger falls back to storing raw parsed JSON in JSONL mode; in compact mode it writes the JSON value as a JSON line to avoid data loss.</li>
+<li><strong>Decoder without header</strong>: V3 decoder requires a preceding <code>H</code>. If you must decode a mid‑file chunk, prepend the header line from the start of that session.</li>
+<li><strong>Mixed inputs</strong>: <code>reinflate_file</code> tries V3 → legacy zlib+base64 JSON → direct JSON → escaped JSON → raw string. You’ll get a line of valid JSON out for each line in.</li>
+</ul>
+<hr>
+<h2 id="10-complexity-performance">10) Complexity &amp; performance</h2>
+<ul>
+<li><strong>Time</strong>: O(n) in bytes processed. Most operations are linear scans; varint and string‑pool lookups are O(1) average.</li>
+<li><strong>Space</strong>: the string pool grows with unique strings (prices/sizes). Typical orderbooks have a small vocabulary (dozens to a few hundred), so memory overhead is modest.</li>
+</ul>
+<hr>
+<h2 id="11-how-compression-is-achieved-side-by-side-intuition-">11) How compression is achieved (side‑by‑side intuition)</h2>
+<p>Consider one <code>price_change</code> event like:</p>
+<pre><code class="lang-json">[{
+  <span class="hljs-attr">"event_type"</span>:<span class="hljs-string">"price_change"</span>,
+  <span class="hljs-attr">"asset_id"</span>:<span class="hljs-string">"&lt;77 chars&gt;"</span>,
+  <span class="hljs-attr">"timestamp"</span>:<span class="hljs-string">"1755744525079"</span>,
+  <span class="hljs-attr">"changes"</span>:[{<span class="hljs-attr">"side"</span>:<span class="hljs-string">"SELL"</span>,<span class="hljs-attr">"price"</span>:<span class="hljs-string">"0.01"</span>,<span class="hljs-attr">"size"</span>:<span class="hljs-string">"28.82"</span>}],
+  <span class="hljs-attr">"market"</span>:<span class="hljs-string">"..."</span>, <span class="hljs-attr">"hash"</span>:<span class="hljs-string">"..."</span>
+}]
+</code></pre>
+<p><strong>Old JSON</strong> (minified):</p>
+<ul>
+<li>Keys + quotes + commas + numbers as ASCII ~200–300 bytes.</li>
+<li><code>asset_id</code> repeated on every event.</li>
+</ul>
+<p><strong>V3 line</strong>:</p>
+<ul>
+<li><strong>Header wrote <code>asset_id</code> once</strong>.</li>
+<li><p>Frame payload:</p>
+<ul>
+<li>1 byte record kind + varint count → ~2–3 bytes</li>
+<li>type_byte + ts_delta varint → <strong>2–3 bytes</strong></li>
+<li>changes: n=1 (varint) + side (1 byte) + pooled price (1–2 bytes) + pooled size (1–2 bytes) → <strong>~4–6 bytes</strong></li>
+</ul>
+</li>
+<li>Deflate further compresses repeats across levels. Base64 adds ~33% overhead to the compressed binary.
+Net: dozens of bytes per frame instead of hundreds.</li>
+</ul>
+<hr>
+<h2 id="12-extending-and-tuning">12) Extending and tuning</h2>
+<ul>
+<li><strong>Periodic pool reset</strong>: emit an extra <code>H</code> every <strong>N frames</strong> (e.g., 10k) to keep string IDs small if the string vocabulary drifts. (Not enabled by default; trivial to add by clearing <code>wrote_header=False</code> every N frames.)</li>
+<li><strong>Multi‑asset sessions</strong>: extend header asset_count &gt; 1 and tag each frame or event with an asset index (e.g., an extra varint).</li>
+<li><strong>More optional fields</strong>: reuse <strong>type_byte bit 3</strong> (or add bits 4,6,7) to gate optional payload fields without overhead.</li>
+<li><strong>Side bit packing</strong>: for very large <code>price_change</code> batches, sides could be bit‑packed 8‑per‑byte (current design uses 1 byte per change for simplicity).</li>
+</ul>
+<hr>
+<h2 id="13-api-reference-functions-classes-">13) API reference (functions/classes)</h2>
+<h3 id="-framecompressorv3-asset_id-str-"><code>FrameCompressorV3(asset_id: str)</code></h3>
+<ul>
+<li><strong>Purpose</strong>: Session‑state compressor for one <code>asset_id</code>.</li>
+<li><p><strong>Public</strong>:</p>
+<ul>
+<li><p><code>compress(raw_frame_str: str) -&gt; str | List[str]</code></p>
+<ul>
+<li>Returns <code>[header_line, frame_line]</code> <strong>on first call that needs a header</strong>.</li>
+<li>Returns a <strong>single line</strong> thereafter.</li>
+</ul>
+</li>
+</ul>
+</li>
+<li><p><strong>Internals</strong> (key methods):</p>
+<ul>
+<li><code>_ensure_header(first_ts: Optional[int]) -&gt; Optional[str]</code></li>
+<li><code>_encode_frame_events(events: List[dict]) -&gt; str</code></li>
+<li><code>_encode_event(ev: dict, out: bytearray) -&gt; None</code></li>
+<li><code>_encode_book/_encode_price_change/_encode_tick_size_change/_encode_last_trade_price</code></li>
+<li><code>_encode_levels(levels, out)</code></li>
+<li><code>_StringPool.encode(s, out)</code> (dictionary pooling)</li>
+</ul>
+</li>
+</ul>
+<h3 id="decoder">Decoder</h3>
+<ul>
+<li><code>_V3State</code>: holds pool, <code>base_ts</code>, <code>prev_ts</code>, asset list, flags.</li>
+<li><p><code>_try_decode_v3_line(token: str, st: _V3State) -&gt; Optional[List[str]]</code>:</p>
+<ul>
+<li>Returns <code>[]</code> on header, <code>[&quot;&lt;json&gt;&quot;]</code> on frame/raw, or <code>None</code> if not V3.</li>
+</ul>
+</li>
+<li><code>_decode_header/_decode_frame/_decode_event/_dec_levels/_decode_raw</code>: binary parsers.</li>
+<li><strong>Tolerant utilities</strong>: <code>_iter_any_entries</code>, <code>_maybe_json_value</code>, <code>_strip_keys</code>.</li>
+<li><p><code>reinflate_file(input_path, output_path, ndjson=True)</code>:</p>
+<ul>
+<li>Streams input → writes <strong>one JSON value per line</strong> (NDJSON) or a single JSON array.</li>
+</ul>
+</li>
+</ul>
+<h3 id="logger">Logger</h3>
+<ul>
+<li><code>MarketSubscriber(..., compression_fn=FrameCompressorV3(...).compress, compact_records=True)</code></li>
+<li><code>DurableJsonlWriter.write_line</code> and <code>.write_json</code></li>
+</ul>
+<hr>
+<h2 id="14-usage-patterns">14) Usage patterns</h2>
+<p><strong>Log with max compression</strong></p>
+<pre><code class="lang-bash"><span class="hljs-comment">python</span> <span class="hljs-comment">polymarket_market_logger</span><span class="hljs-string">.</span><span class="hljs-comment">py</span> <span class="hljs-literal">-</span><span class="hljs-literal">-</span><span class="hljs-comment">asset</span> <span class="hljs-comment">YOUR_ASSET_ID</span> <span class="hljs-literal">-</span><span class="hljs-literal">-</span><span class="hljs-comment">out</span> <span class="hljs-comment">updates</span><span class="hljs-string">.</span><span class="hljs-comment">v3</span>
+</code></pre>
+<p><strong>Reinflate to NDJSON</strong></p>
+<pre><code class="lang-bash">python decoder.py <span class="hljs-comment">--in updates.v3 --out updates.ndjson</span>
+# each <span class="hljs-literal">line</span> <span class="hljs-keyword">is</span> either: JSON <span class="hljs-keyword">array</span> <span class="hljs-keyword">of</span> events <span class="hljs-keyword">OR</span> a JSON <span class="hljs-built_in">string</span> like <span class="hljs-string">"PONG"</span>
+</code></pre>
+<p><strong>Decode older mixed logs</strong></p>
+<pre><code class="lang-bash">python decoder<span class="hljs-selector-class">.py</span> --<span class="hljs-keyword">in</span> old_mixed<span class="hljs-selector-class">.log</span> --out normalized.ndjson
+</code></pre>
+<hr>
+<h2 id="15-testing-checklist">15) Testing checklist</h2>
+<ul>
+<li><strong>Header+frame round‑trip</strong>: compress a known sequence of frames (book + price_change + tick_size_change + last_trade_price), decode, and compare JSON (minus <code>market</code>/<code>hash</code>).</li>
+<li><strong>Array vs. single‑object frames</strong>: both should round‑trip.</li>
+<li><strong>Raw frames (&quot;PONG&quot;)</strong>: round‑trip as a JSON string.</li>
+<li><strong>Out‑of‑order timestamps</strong>: ensure encoder flips <code>ts_abs</code> and decoder reproduces exact values.</li>
+<li><strong>Large vocabularies</strong>: verify pool growth and reference decoding.</li>
+<li><strong>Legacy inputs</strong>: ensure reinflater can read old files and produce normalized JSON.</li>
+</ul>
+<hr>
+<h2 id="16-practical-tips-pitfalls">16) Practical tips &amp; pitfalls</h2>
+<ul>
+<li><strong>Start decoding at a header</strong>: copying from the middle of a file requires including the nearest preceding <code>H</code> line for that session.</li>
+<li><strong>File rotation</strong>: each new file naturally begins with a header (first event triggers it).</li>
+<li><strong>Durability vs. throughput</strong>: fsync per line is safest; batching reduces syscalls (configure at your own risk).</li>
+<li><strong>Security</strong>: don’t feed untrusted files without sandboxing; decompression bombs are a generic risk with any compressor. The tool is line‑streaming, which helps.</li>
+</ul>
+<hr>
+<h2 id="17-glossary">17) Glossary</h2>
+<ul>
+<li><strong>Raw DEFLATE</strong>: zlib’s deflate algorithm <strong>without</strong> zlib header or checksum (<code>wbits=-15</code>).</li>
+<li><strong>Base64‑URL</strong>: base64 variant using <code>-</code> and <code>_</code>, safe for filenames/URLs.</li>
+<li><strong>LEB128 (uvarint)</strong>: variable‑length integer encoding using 7 bits per byte and MSB continuation.</li>
+<li><strong>NDJSON</strong>: Newline‑Delimited JSON; one JSON value per line.</li>
+</ul>
+<hr>
+<h2 id="18-appendix-worked-micro-example">18) Appendix — Worked micro‑example</h2>
+<p><strong>Input frame (list with one book event)</strong></p>
+<pre><code class="lang-json">[{<span class="hljs-attr">"event_type"</span>:<span class="hljs-string">"book"</span>,<span class="hljs-attr">"asset_id"</span>:<span class="hljs-string">"A...Z"</span>,<span class="hljs-attr">"timestamp"</span>:<span class="hljs-string">"1755744523348"</span>,
+  <span class="hljs-attr">"bids"</span>:[{<span class="hljs-attr">"price"</span>:<span class="hljs-string">"0.01"</span>,<span class="hljs-attr">"size"</span>:<span class="hljs-string">"28.82"</span>}],
+  <span class="hljs-attr">"asks"</span>:[{<span class="hljs-attr">"price"</span>:<span class="hljs-string">"0.99"</span>,<span class="hljs-attr">"size"</span>:<span class="hljs-string">"10"</span>}],
+  <span class="hljs-attr">"market"</span>:<span class="hljs-string">"..."</span>, <span class="hljs-attr">"hash"</span>:<span class="hljs-string">"..."</span>}]
+</code></pre>
+<p><strong>Encoding notes</strong></p>
+<ul>
+<li>Header <code>H</code> is written once with <code>asset_id=&quot;A...Z&quot;</code>, <code>base_ts=1755744523348</code>.</li>
+<li><p>Frame <code>F</code>:</p>
+<ul>
+<li><code>event_count=1</code></li>
+<li>Event type=book (0), <code>ts_abs=0</code>, delta=0 → <code>type_byte=0</code>, <code>uvarint(0)</code>.</li>
+<li><code>n_bids=1</code>: pool literal <code>&quot;0.01&quot;</code>, literal <code>&quot;28.82&quot;</code>.</li>
+<li><code>n_asks=1</code>: pool literal <code>&quot;0.99&quot;</code>, literal <code>&quot;10&quot;</code>.</li>
+</ul>
+</li>
+</ul>
+<p><strong>On a later frame</strong> repeating the same prices/sizes, the four strings encode as <strong>references</strong> (single‑byte varints) instead of literals.</p>
+<hr>
